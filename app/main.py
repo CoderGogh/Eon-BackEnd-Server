@@ -3,7 +3,7 @@ import time
 from datetime import datetime, timezone, timedelta
 import os
 
-from fastapi import FastAPI, Depends, HTTPException, status, APIRouter, Response, Header, Body, Query, Path
+from fastapi import FastAPI, Depends, HTTPException, status, APIRouter, Response, Header, Query, Path
 from typing import Optional
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +18,6 @@ import math
 import json
 import re
 
-# 프로젝트 내부 모듈 임포트
 from app.core.config import settings
 from app.db.database import get_async_session
 from app.redis_client import (
@@ -31,20 +30,14 @@ from app.redis_client import (
 from app.api.v1.api import api_router
 from app.api.deps import frontend_api_key_required
 
-# --- 환경 변수로 관리자 모드 판단 ---
 IS_ADMIN = os.getenv("ADMIN_MODE", "false").lower() == "true"
 
-# --- Lifespan Context Manager 정의 ---
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Application startup: Initializing resources...")
     await init_redis_pool()
-    # [TODO] DB 마이그레이션 확인 및 초기 데이터 로드
     yield
-    print("Application shutdown: Cleaning up resources...")
     await close_redis_pool()
 
-# --- HTTP Basic 인증 (관리자 전용) ---
 security = HTTPBasic()
 raw_admins = os.getenv("ADMIN_CREDENTIALS", "")
 ADMIN_ACCOUNTS = dict([cred.split(":") for cred in raw_admins.split(",") if cred])
@@ -55,14 +48,8 @@ def admin_required(credentials: HTTPBasicCredentials = Depends(security)):
     return True
 
 
-# frontend API key dependency moved to `app.api.deps` to avoid circular imports
-
-
 def ensure_read_only_sql(sql: str):
-    """Basic guard to ensure the provided SQL starts with SELECT to avoid write queries.
-
-    This is a defensive, best-effort check and should be combined with parameterized queries and DB user permissions.
-    """
+    """SELECT 쿼리만 허용하는 방어적 가드. DB 사용자 권한과 병행해서 사용해야 함."""
     if not sql.strip().lower().startswith("select"):
         raise HTTPException(status_code=400, detail="Only read-only SELECT queries are allowed")
 
@@ -115,157 +102,82 @@ def read_root():
 
 @app.head("/", include_in_schema=False)
 def head_root():
-    """Explicit HEAD handler to make uptime probes (HEAD) return 200 without body."""
     return Response(status_code=200)
 
 
 @app.get("/health", tags=["Infrastructure"], summary="Health check (DB & Redis)")
-@app.head("/health")    
+@app.head("/health")
 async def health_check(db: AsyncSession = Depends(get_async_session), redis_client: Redis = Depends(get_redis_client)):
-    """Simple health check endpoint. Returns 200 if at least one of DB/Redis responds, 503 if both fail.
-
-    Response body example:
-    {
-      "status": "ok",
-      "db": true,
-      "redis": true
-    }
-    """
     db_ok = False
     redis_ok = False
 
-    # DB check
     try:
         await db.execute(text("SELECT 1"))
         db_ok = True
     except Exception:
-        db_ok = False
+        pass
 
-    # Redis check
     try:
         if redis_client:
             await redis_client.ping()
             redis_ok = True
     except Exception:
-        redis_ok = False
+        pass
 
     if db_ok or redis_ok:
-        status_str = "ok"
-        code = 200
-    else:
-        status_str = "down"
-        code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return JSONResponse(status_code=200, content={"status": "ok", "db": db_ok, "redis": redis_ok})
+    return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"status": "down", "db": db_ok, "redis": redis_ok})
 
-    return JSONResponse(status_code=code, content={"status": status_str, "db": db_ok, "redis": redis_ok})
+
+def _query_subsidies(manufacturer: str, model_group: str):
+    return (
+        "SELECT model_name, subsidy_national_10k_won, subsidy_local_10k_won, subsidy_total_10k_won, sale_price "
+        "FROM subsidies "
+        "WHERE manufacturer = :manufacturer AND model_group = :model_group "
+        "ORDER BY model_name LIMIT 100"
+    )
+
+
+def _map_subsidy_rows(rows) -> list:
+    mapped = []
+    for r in rows:
+        m = r._mapping
+        nat = m.get("subsidy_national_10k_won")
+        loc = m.get("subsidy_local_10k_won")
+        tot = m.get("subsidy_total_10k_won")
+        mapped.append({
+            "model_name": m.get("model_name"),
+            "subsidy_national": int(nat) if nat is not None else None,
+            "subsidy_local": int(loc) if loc is not None else None,
+            "subsidy_total": int(tot) if tot is not None else None,
+            "salePrice": int(m.get("sale_price")) if m.get("sale_price") is not None else None,
+        })
+    return mapped
 
 
 @app.get("/subsidy", tags=["Subsidy"], summary="Lookup subsidies by manufacturer and model_group")
 async def subsidy_lookup(manufacturer: str, model_group: str, db: AsyncSession = Depends(get_async_session), _ok: bool = Depends(frontend_api_key_required)):
-    """Return subsidy rows for given manufacturer and model_group.
-
-    Response format (list of objects):
-    [
-      {
-        "model_name": str,
-        "subsidy_national": int,
-        "subsidy_local": int,
-        "subsidy_total": int
-      },
-      ...
-    ]
-    """
     try:
-        query_sql = (
-            "SELECT model_name, subsidy_national_10k_won, subsidy_local_10k_won, subsidy_total_10k_won, sale_price "
-            "FROM subsidies "
-            "WHERE manufacturer = :manufacturer AND model_group = :model_group "
-            "ORDER BY model_name LIMIT 100"
-        )
+        query_sql = _query_subsidies(manufacturer, model_group)
         ensure_read_only_sql(query_sql)
         result = await db.execute(text(query_sql), {"manufacturer": manufacturer, "model_group": model_group})
-        rows = result.fetchall()
-
-        mapped = []
-        for r in rows:
-            m = r._mapping
-            # convert to ints if not None
-            nat = m.get("subsidy_national_10k_won")
-            loc = m.get("subsidy_local_10k_won")
-            tot = m.get("subsidy_total_10k_won")
-            mapped.append({
-                "model_name": m.get("model_name"),
-            "subsidy_national": int(nat) if nat is not None else None,
-            "subsidy_local": int(loc) if loc is not None else None,
-            "subsidy_total": int(tot) if tot is not None else None,
-            # sale_price may be null; expose as integer when present
-            "salePrice": int(m.get("sale_price")) if m.get("sale_price") is not None else None,
-            })
-
-        return JSONResponse(status_code=200, content=mapped)
+        return JSONResponse(status_code=200, content=_map_subsidy_rows(result.fetchall()))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/subsidy/by", tags=["Subsidy"], summary="Lookup subsidies (camelCase) by manufacturer and modelGroup")
 async def subsidy_lookup_camel(manufacturer: str, modelGroup: str, db: AsyncSession = Depends(get_async_session), _ok: bool = Depends(frontend_api_key_required)):
-    """Compatibility wrapper: accept camelCase `modelGroup` from frontend and return subsidy rows.
-
-    Header: x-api-key: <key>
-    Query params: manufacturer, modelGroup
-    """
-    # reuse same logic as /subsidy but accept modelGroup camelCase
-    model_group = modelGroup
+    """camelCase modelGroup 파라미터를 허용하는 호환성 래퍼."""
     try:
-        query_sql = (
-            "SELECT model_name, subsidy_national_10k_won, subsidy_local_10k_won, subsidy_total_10k_won, sale_price "
-            "FROM subsidies "
-            "WHERE manufacturer = :manufacturer AND model_group = :model_group "
-            "ORDER BY model_name LIMIT 100"
-        )
+        query_sql = _query_subsidies(manufacturer, modelGroup)
         ensure_read_only_sql(query_sql)
-        result = await db.execute(text(query_sql), {"manufacturer": manufacturer, "model_group": model_group})
-        rows = result.fetchall()
-
-        mapped = []
-        for r in rows:
-            m = r._mapping
-            nat = m.get("subsidy_national_10k_won")
-            loc = m.get("subsidy_local_10k_won")
-            tot = m.get("subsidy_total_10k_won")
-            mapped.append({
-                "model_name": m.get("model_name"),
-            "subsidy_national": int(nat) if nat is not None else None,
-            "subsidy_local": int(loc) if loc is not None else None,
-            "subsidy_total": int(tot) if tot is not None else None,
-            # include salePrice for frontend compatibility (may be None)
-            "salePrice": int(m.get("sale_price")) if m.get("sale_price") is not None else None,
-            })
-
-        return JSONResponse(status_code=200, content=mapped)
+        result = await db.execute(text(query_sql), {"manufacturer": manufacturer, "model_group": modelGroup})
+        return JSONResponse(status_code=200, content=_map_subsidy_rows(result.fetchall()))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 충전소/충전기 검색 엔드포인트 (보조금 기능과 완전 독립) ---
-@app.get("/api/v1/stations-test-new", tags=["Station"], summary="NEW CODE TEST - EV charging stations")
-async def search_ev_stations_new_test(
-    lat: float = Query(..., description="위도", ge=-90, le=90),
-    lon: float = Query(..., description="경도", ge=-180, le=180),
-    radius: int = Query(..., description="검색 반경(미터)", ge=100, le=15000),
-    page: int = Query(1, description="페이지 번호", ge=1),
-    limit: int = Query(20, description="페이지당 결과 수", ge=1, le=100),
-    api_key: str = Depends(frontend_api_key_required),
-    db: AsyncSession = Depends(get_async_session),
-    redis_client: Redis = Depends(get_redis_client)
-):
-    """🚨 NEW CODE TEST ENDPOINT"""
-    print(f"🔥🔥🔥 TEST ENDPOINT - NEW CODE CONFIRMED RUNNING 🔥🔥🔥")
-    return {
-        "message": "NEW CODE IS RUNNING!",
-    "timestamp": datetime.now(timezone.utc).isoformat(),
-        "received_params": {"lat": lat, "lon": lon, "radius": radius}
-    }
-
-@app.get("/api/v1/stations", tags=["Station"], summary="✅ 요구사항 완전 준수 - 충전소 검색")
+@app.get("/api/v1/stations", tags=["Station"], summary="충전소 검색")
 async def search_ev_stations_requirement_compliant(
     lat: str = Query(..., description="사용자 위도 (string 타입)", regex=r"^-?\d+\.?\d*$"),
     lon: str = Query(..., description="사용자 경도 (string 타입)", regex=r"^-?\d+\.?\d*$"),
@@ -276,24 +188,12 @@ async def search_ev_stations_requirement_compliant(
     db: AsyncSession = Depends(get_async_session),
     redis_client: Redis = Depends(get_redis_client)
 ):
-    """
-    ✅ 백엔드 요구사항 완전 준수 구현
-    
-    1. 사용자 위도/경도(string) → 시/군/구/동 매핑 → addr 생성
-    2. Cache 조회 → DB 조회 → API 호출 순서
-    3. 반경 기준값(1000/3000/5000/7000/10000) 처리
-    4. 정적/동적 데이터 분리 저장
-    5. 응답: 충전소ID, 충전기주소(addr), 충전소명칭, 위도, 경도 (모두 string)
-    """
-    print(f"✅ 요구사항 준수 충전소 검색 시작")
-    print(f"✅ 입력: lat={lat}, lon={lon}, radius={radius}")
-    
+    """좌표 → 주소 변환 후 캐시/DB/KEPCO API 순서로 충전소를 조회합니다."""
     try:
-        # === 1단계: 좌표 → 주소 변환 ===
         lat_float = float(lat)
         lon_float = float(lon)
-        
-        # Nominatim을 통한 역지오코딩
+
+        # 좌표 → 시/군/구 주소 변환 (Nominatim)
         async with httpx.AsyncClient() as client:
             nominatim_response = await client.get(
                 "https://nominatim.openstreetmap.org/reverse",
@@ -307,75 +207,42 @@ async def search_ev_stations_requirement_compliant(
                 headers={"User-Agent": "Codyssey-EV-App/1.0"},
                 timeout=10.0
             )
-            
+
+            addr = "서울특별시"
             if nominatim_response.status_code == 200:
-                nominatim_data = nominatim_response.json()
-                address_components = nominatim_data.get("address", {})
-                
-                # 시/군/구/동 추출
+                address_components = nominatim_response.json().get("address", {})
                 city = address_components.get("city") or address_components.get("town") or ""
                 district = address_components.get("borough") or address_components.get("suburb") or ""
-                addr = f"{city} {district}".strip()
-                
-                if not addr:
-                    addr = "서울특별시"  # 기본값
-            else:
-                addr = "서울특별시"  # 기본값
-        
-        print(f"✅ 매핑된 주소: {addr}")
-        
-        # === 2단계: 반경 기준값 정규화 ===
-        # Use "이하" (less than or equal) mapping: map requested radius to
-        # the smallest canonical bucket that is >= requested value.
-        # New required buckets per product spec:
-        # 5000, 10000, 15000 (meters)
-        radius_standards = [5000, 10000, 15000]
+                addr = f"{city} {district}".strip() or "서울특별시"
 
-        # Normalize the requested radius to an integer and find the smallest
-        # canonical bucket that is >= the requested radius. This avoids
-        # surprising mappings caused by float/string inputs.
+        # 반경을 최소 캐노니컬 버킷으로 정규화 (5000 / 10000 / 15000)
+        radius_standards = [5000, 10000, 15000]
         try:
             requested_radius = int(round(float(radius)))
         except Exception:
             requested_radius = radius
-
         actual_radius = next((r for r in radius_standards if requested_radius <= r), radius_standards[-1])
-        print(f"✅ 반경 정규화: requested={requested_radius} -> normalized={actual_radius} (buckets={radius_standards})")
-        
-        # === 3단계: Cache 조회 ===
-        # Use rounded coordinates in the cache key to avoid cache collisions caused
-        # by tiny floating differences. We keep raw lat/lon (lat_float/lon_float)
-        # for distance calculations, but round the coordinates used in cache keys.
-        # Per product decision, use 2 decimal places (~1.11km) for cache keys.
+
+        # 캐시 키 생성 (좌표를 반올림하여 미세한 차이로 인한 키 분산 방지)
         coord_decimals = getattr(settings, "CACHE_COORD_ROUND_DECIMALS", 2)
         lat_round = round(lat_float, coord_decimals)
         lon_round = round(lon_float, coord_decimals)
-        # Use coordinate-first key (avoid addr text differences)
-        # include pagination in cache key so different pages/limits are cached separately
         cache_key = f"stations:lat{lat_round}:lon{lon_round}:r{actual_radius}:p{page}:l{limit}"
-        # persistent cache key (longer TTL) to keep static station positions for
-        # map-marker UX when users return to a previously-viewed region.
         persistent_key = f"stations_persistent:lat{lat_round}:lon{lon_round}:r{actual_radius}:p{page}:l{limit}"
 
         try:
             cached_data = await redis_client.get(cache_key)
             if cached_data:
-                print(f"✅ Cache Hit: {cache_key}")
                 cached_result = json.loads(cached_data)
-                
-                # 거리 필터링 후 반환
                 filtered_stations = []
                 for station in cached_result.get("stations", []):
-                    # cached station contains only static fields (no distance_m)
                     dist = calculate_distance_haversine(
                         lat_float, lon_float,
                         float(station["lat"]), float(station["lon"])
                     )
                     if dist <= radius:
-                        # avoid mutating cached object
                         station_out = dict(station)
                         station_out["distance_m"] = str(int(dist))
-                        # fetch charger counts per-station (do not store counts in the cache)
                         try:
                             counts_q = "SELECT COUNT(*) AS total_ch, COALESCE(SUM( (cp_stat::text = '1')::int ), 0) AS avail_ch FROM chargers WHERE cs_id = :cs_id"
                             cnt_res = await db.execute(text(counts_q), {"cs_id": station_out.get("station_id")})
@@ -393,14 +260,13 @@ async def search_ev_stations_requirement_compliant(
                         station_out["total_chargers"] = total_ch
                         station_out["available_chargers"] = avail_ch
                         filtered_stations.append(station_out)
-                
+
                 filtered_stations.sort(key=lambda x: int(x["distance_m"]))
-                # Metrics: increment short-lived cache hit counter (best-effort)
                 try:
                     if redis_client:
                         await redis_client.incr("metrics:stations:cache_hits:short")
-                except Exception as _merr:
-                    print(f"⚠️ Metric increment (short cache) failed: {_merr}")
+                except Exception:
+                    pass
 
                 return {
                     "source": "cache",
@@ -408,19 +274,14 @@ async def search_ev_stations_requirement_compliant(
                     "radius_normalized": actual_radius,
                     "stations": filtered_stations
                 }
-            # Short-lived cache miss -> try persistent static cache for fast map markers
+            # 단기 캐시 미스 → 장기 정적 캐시 확인
             try:
                 persistent_raw = await redis_client.get(persistent_key)
                 if persistent_raw:
-                    print(f"✅ Persistent Cache Hit: {persistent_key}")
                     persistent_result = json.loads(persistent_raw)
-                    # Return static markers quickly. We compute distances but do
-                    # NOT fetch per-station charger counts here to keep the
-                    # response fast; frontend should request details on click.
                     filtered_stations = []
                     station_ids = [s.get("station_id") for s in persistent_result.get("stations", []) if s.get("station_id")]
 
-                    # Batch-fetch charger counts for all stations to avoid N queries.
                     counts_map = {}
                     try:
                         if station_ids:
@@ -431,15 +292,14 @@ async def search_ev_stations_requirement_compliant(
                                 GROUP BY cs_id
                             """
                             res = await db.execute(text(counts_q), {"cs_ids": station_ids})
-                            rows = res.fetchall()
-                            for r in rows:
+                            for r in res.fetchall():
                                 m = r._mapping
                                 counts_map[str(m.get("cs_id"))] = {
                                     "total": int(m.get("total_ch") or 0),
                                     "avail": int(m.get("avail_ch") or 0)
                                 }
-                    except Exception as _batch_err:
-                        print(f"⚠️ Batch counts query failed (ignored): {_batch_err}")
+                    except Exception:
+                        pass
 
                     for station in persistent_result.get("stations", []):
                         try:
@@ -453,7 +313,6 @@ async def search_ev_stations_requirement_compliant(
                         if dist <= radius:
                             station_out = dict(station)
                             station_out["distance_m"] = str(int(dist))
-                            # Attach batch counts if available; otherwise None
                             sid = str(station_out.get("station_id")) if station_out.get("station_id") is not None else None
                             if sid and sid in counts_map:
                                 station_out["total_chargers"] = counts_map[sid]["total"]
@@ -464,12 +323,11 @@ async def search_ev_stations_requirement_compliant(
                             filtered_stations.append(station_out)
 
                     filtered_stations.sort(key=lambda x: int(x["distance_m"]))
-                    # Metrics: increment persistent cache hit counter (best-effort)
                     try:
                         if redis_client:
                             await redis_client.incr("metrics:stations:cache_hits:persistent")
-                    except Exception as _merr:
-                        print(f"⚠️ Metric increment (persistent cache) failed: {_merr}")
+                    except Exception:
+                        pass
 
                     return {
                         "source": "persistent_cache",
@@ -477,22 +335,13 @@ async def search_ev_stations_requirement_compliant(
                         "radius_normalized": actual_radius,
                         "stations": filtered_stations
                     }
-            except Exception as _p_err:
-                print(f"⚠️ Persistent cache read error (ignored): {_p_err}")
-        except Exception as cache_error:
-            print(f"⚠️ Cache 오류: {cache_error}")
-        
-    # === 4단계: DB 조회 (정적 데이터) ===
-        print(f"✅ DB 조회 시작...")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         try:
-            # 정적 데이터 조회 (충전기 상태코드 제외)
-            # NOTE: some deployments may not have KEPCO-specific columns (cs_nm/addr).
-            # To remain resilient against schema drift we select stable columns
-            # and map them to the expected keys in Python.
-            # Note: production DB uses PostGIS `location` (geometry/point) and columns `name`/`address`.
-            # Use ST_Y(location) for latitude and ST_X(location) for longitude. Keep COALESCE for address/name.
-            # Try a spatial query (PostGIS). If the DB does not support PostGIS or
-            # the `location` column is missing, fall back to a name/address LIKE query.
+            # PostGIS 공간 쿼리 우선 시도, 실패 시 주소 LIKE 쿼리로 폴백
             spatial_query = """
                 SELECT DISTINCT
                     cs_id as station_id,
@@ -500,9 +349,7 @@ async def search_ev_stations_requirement_compliant(
                     COALESCE(name, '') as station_name,
                     ST_Y(location)::text as lat,
                     ST_X(location)::text as lon,
-                    -- compute distance in meters on DB side for accurate ordering/filtering
                     ROUND(ST_Distance(location::geography, ST_SetSRID(ST_MakePoint(:lon, :lat), 4326)::geography))::int as distance_m,
-                    -- charger counts (total and available). We treat cp_stat values '0' and '1' as available.
                     (SELECT COUNT(*) FROM chargers WHERE cs_id = stations.cs_id) AS total_chargers,
                     (SELECT COALESCE(SUM( (cp_stat::text = '1')::int ), 0) FROM chargers WHERE cs_id = stations.cs_id) AS available_chargers
                 FROM stations
@@ -516,7 +363,6 @@ async def search_ev_stations_requirement_compliant(
                 LIMIT :limit OFFSET :offset
             """
 
-            # Fallback query when spatial support is unavailable
             fallback_name_query = """
                 SELECT DISTINCT
                     cs_id as station_id,
@@ -535,14 +381,12 @@ async def search_ev_stations_requirement_compliant(
             """
 
             try:
-                # pass the normalized radius to the spatial query
                 offset = (page - 1) * limit
                 result = await db.execute(
                     text(spatial_query),
                     {"lon": lon_float, "lat": lat_float, "radius_m": actual_radius, "limit": limit, "offset": offset}
                 )
             except Exception:
-                # If spatial query fails (no PostGIS or column differences), fallback
                 result = await db.execute(
                     text(fallback_name_query),
                     {
@@ -552,15 +396,12 @@ async def search_ev_stations_requirement_compliant(
                     }
                 )
             db_stations = result.fetchall()
-            
+
             if db_stations:
-                print(f"✅ DB Hit: {len(db_stations)}개 충전소 발견")
-                
                 db_result = []
                 for row in db_stations:
                     try:
                         row_dict = row._mapping
-                        # prefer DB-calculated distance_m when available (faster and consistent)
                         db_distance = row_dict.get("distance_m")
                         try:
                             dist_val = int(db_distance) if db_distance is not None else int(calculate_distance_haversine(
@@ -570,66 +411,40 @@ async def search_ev_stations_requirement_compliant(
                             dist_val = int(calculate_distance_haversine(lat_float, lon_float, float(row_dict["lat"]), float(row_dict["lon"])))
 
                         if dist_val <= radius:
-                                # charger counts from DB subselects
-                                total_ch = int(row_dict.get("total_chargers") or 0)
-                                avail_ch = int(row_dict.get("available_chargers") or 0)
-                                db_result.append({
-                                    "station_id": str(row_dict["station_id"]),
-                                    "addr": str(row_dict["addr"]),
-                                    "station_name": str(row_dict["station_name"]),
-                                    "lat": str(row_dict["lat"]),
-                                    "lon": str(row_dict["lon"]),
-                                    # ensure distance is returned as string (frontend expects string)
-                                    "distance_m": str(int(dist_val)),
-                                    "total_chargers": total_ch,
-                                    "available_chargers": avail_ch
-                                })
-                    except Exception as row_error:
-                        print(f"⚠️ DB row 처리 오류: {row_error}")
+                            db_result.append({
+                                "station_id": str(row_dict["station_id"]),
+                                "addr": str(row_dict["addr"]),
+                                "station_name": str(row_dict["station_name"]),
+                                "lat": str(row_dict["lat"]),
+                                "lon": str(row_dict["lon"]),
+                                "distance_m": str(int(dist_val)),
+                                "total_chargers": int(row_dict.get("total_chargers") or 0),
+                                "available_chargers": int(row_dict.get("available_chargers") or 0)
+                            })
+                    except Exception:
                         continue
                 
                 if db_result:
-                    # sort by distance (and log a small sample for debugging radius handling)
                     db_result.sort(key=lambda x: calculate_distance_haversine(
                         lat_float, lon_float, float(x["lat"]), float(x["lon"])
                     ))
                     try:
-                        distances = [int(x.get("distance_m") or calculate_distance_haversine(lat_float, lon_float, float(x["lat"]), float(x["lon"]))) for x in db_result]
-                        sample = distances[:10]
-                        print(f"🔍 Debug distances sample (meters): count={len(distances)} sample={sample}")
-                    except Exception as _dist_err:
-                        print(f"⚠️ 거리 디버그 생성 실패: {_dist_err}")
-                    
-                    # Cache에 저장
-                    try:
-                        # don't cache empty results; when caching, exclude dynamic fields
-                        if db_result:
-                            # Exclude dynamic fields (distance and charger counts) from cache
-                            cache_stations = [{k: v for k, v in s.items() if k not in ("distance_m", "total_chargers", "available_chargers")} for s in db_result]
-                            cache_data = {"stations": _serialize_for_cache(cache_stations), "timestamp": datetime.now(timezone.utc).isoformat()}
-                            await redis_client.setex(cache_key, settings.CACHE_EXPIRE_SECONDS, json.dumps(_serialize_for_cache(cache_data), ensure_ascii=False))
-                            # Also write a persistent, long-lived static snapshot used
-                            # to quickly repopulate map markers when users return.
-                            try:
-                                persistent_ttl = getattr(settings, "PERSISTENT_STATION_CACHE_SECONDS", 86400)
-                                await redis_client.setex(persistent_key, persistent_ttl, json.dumps(_serialize_for_cache(cache_data), ensure_ascii=False))
-                                print(f"✅ DB 결과 Persistent Cache 저장 완료: key={persistent_key} ttl={persistent_ttl}s")
-                            except Exception as _p_e:
-                                print(f"⚠️ Persistent cache write failed (ignored): {_p_e}")
-
-                            print(f"✅ DB 결과 Cache 저장 완료: key={cache_key} ttl={settings.CACHE_EXPIRE_SECONDS}s")
-                        # Metrics: DB-path result
+                        cache_stations = [{k: v for k, v in s.items() if k not in ("distance_m", "total_chargers", "available_chargers")} for s in db_result]
+                        cache_data = {"stations": _serialize_for_cache(cache_stations), "timestamp": datetime.now(timezone.utc).isoformat()}
+                        await redis_client.setex(cache_key, settings.CACHE_EXPIRE_SECONDS, json.dumps(_serialize_for_cache(cache_data), ensure_ascii=False))
+                        try:
+                            persistent_ttl = getattr(settings, "PERSISTENT_STATION_CACHE_SECONDS", 86400)
+                            await redis_client.setex(persistent_key, persistent_ttl, json.dumps(_serialize_for_cache(cache_data), ensure_ascii=False))
+                        except Exception:
+                            pass
                         try:
                             if redis_client:
                                 await redis_client.incr("metrics:stations:cache_hits:db")
-                        except Exception as _merr:
-                            print(f"⚠️ Metric increment (db) failed: {_merr}")
-                        else:
-                            print(f"ℹ️ DB 결과 빈 리스트 - 캐시 저장 생략: key={cache_key}")
-                    except Exception as _c_err:
-                        print(f"⚠️ Cache 저장 실패: {_c_err}")
+                        except Exception:
+                            pass
+                    except Exception:
                         pass
-                    
+
                     return {
                         "source": "database",
                         "addr": addr,
@@ -637,26 +452,17 @@ async def search_ev_stations_requirement_compliant(
                         "stations": db_result
                     }
         except Exception as db_error:
-            # If a DB error occurs, rollback the session so subsequent DB commands
-            # (e.g. inserts) are not run inside an aborted transaction.
             try:
                 await db.rollback()
             except Exception:
                 pass
-            print(f"⚠️ DB 조회 오류: {db_error}")
-        
-        # === 5단계: API 호출 및 저장 ===
-        print(f"✅ KEPCO API 호출 시작...")
-        # use module-level `settings` imported at top to avoid UnboundLocalError
+
         kepco_url = settings.EXTERNAL_STATION_API_BASE_URL
         kepco_key = settings.EXTERNAL_STATION_API_KEY
-        
+
         if not kepco_url or not kepco_key:
             raise HTTPException(status_code=500, detail="KEPCO API 설정 누락")
-        
-        print(f"✅ KEPCO URL: {kepco_url}")
-        print(f"✅ Making KEPCO API request to: {kepco_url}")
-        
+
         async with httpx.AsyncClient() as client:
             kepco_response = await client.get(
                 kepco_url,
@@ -667,19 +473,15 @@ async def search_ev_stations_requirement_compliant(
                 },
                 timeout=30.0
             )
-            
-            print(f"✅ KEPCO Response Status: {kepco_response.status_code}")
-            
+
             if kepco_response.status_code != 200:
                 raise HTTPException(
                     status_code=502,
                     detail=f"KEPCO API 오류: HTTP {kepco_response.status_code}"
                 )
-            
+
             kepco_data = kepco_response.json()
-            print(f"✅ KEPCO API 응답 수신 완료")
-        
-        # === 6단계: 데이터 처리 및 DB 저장 ===
+
         api_stations = []
         now = datetime.now(timezone.utc)
         
@@ -691,30 +493,25 @@ async def search_ev_stations_requirement_compliant(
                     try:
                         item_lat = float(item.get("lat", 0))
                         item_lon = float(item.get("longi", 0))
-                        
+
                         if item_lat == 0 or item_lon == 0:
                             continue
-                        
+
                         dist = calculate_distance_haversine(lat_float, lon_float, item_lat, item_lon)
                         if dist > radius:
                             continue
-                        
-                        station_data = {
+
+                        api_stations.append({
                             "station_id": str(item.get("csId", "")),
                             "addr": str(item.get("addr", "")),
                             "station_name": str(item.get("csNm", "")),
                             "lat": str(item_lat),
                             "lon": str(item_lon),
                             "distance_m": str(int(dist))
-                        }
-                        api_stations.append(station_data)
-                        
-                        # DB에 저장 (정적 데이터) - 안전한 방식
-                        try:
-                            # Ensure we are not in an aborted transaction from an earlier error
-                            await _clear_db_transaction(db)
+                        })
 
-                            # Use PostGIS location column. Some DBs don't have lat/long columns.
+                        try:
+                            await _clear_db_transaction(db)
                             insert_sql = """
                                 INSERT INTO stations (cs_id, address, name, location, raw_data, last_synced_at)
                                 VALUES (:cs_id, :address, :name, ST_SetSRID(ST_MakePoint(:longi, :lat), 4326), :raw_data, :update_time)
@@ -725,7 +522,6 @@ async def search_ev_stations_requirement_compliant(
                                     raw_data = EXCLUDED.raw_data,
                                     last_synced_at = EXCLUDED.last_synced_at
                             """
-                            
                             await db.execute(text(insert_sql), {
                                 "cs_id": item.get("csId"),
                                 "address": item.get("addr"),
@@ -735,63 +531,45 @@ async def search_ev_stations_requirement_compliant(
                                 "raw_data": json.dumps(item, ensure_ascii=False),
                                 "update_time": now
                             })
-                        except Exception as insert_error:
-                            # If insert fails, rollback so the session is usable for later operations
+                        except Exception:
                             try:
                                 await _clear_db_transaction(db)
                             except Exception:
                                 pass
-                            print(f"⚠️ DB 저장 오류: {insert_error}")
-                    
-                    except Exception as item_error:
-                        print(f"⚠️ Item 처리 오류: {item_error}")
+
+                    except Exception:
                         continue
-                
-                # 트랜잭션 커밋
+
                 try:
                     await db.commit()
-                    print(f"✅ DB 저장 완료: {len(api_stations)}개 충전소")
-                except Exception as commit_error:
-                    print(f"⚠️ 트랜잭션 커밋 오류: {commit_error}")
+                except Exception:
                     await db.rollback()
-        
-        # === 7단계: Cache 저장 및 결과 반환 ===
+
         api_stations.sort(key=lambda x: calculate_distance_haversine(
             lat_float, lon_float, float(x["lat"]), float(x["lon"])
         ))
-        # Deduplicate stations by station_id before caching/returning
         try:
             api_stations = _dedupe_stations_by_id(api_stations)
         except Exception:
             pass
 
         try:
-            # Avoid caching empty API results
             if api_stations:
-                # when caching API results, exclude dynamic fields (distance and charger counts)
                 cache_stations = [{k: v for k, v in s.items() if k not in ("distance_m", "total_chargers", "available_chargers")} for s in api_stations]
                 cache_data = {"stations": _serialize_for_cache(cache_stations), "timestamp": now.isoformat()}
                 await redis_client.setex(cache_key, settings.CACHE_EXPIRE_SECONDS, json.dumps(_serialize_for_cache(cache_data), ensure_ascii=False))
-                # Also persist a static snapshot for faster marker rehydration
                 try:
                     persistent_ttl = getattr(settings, "PERSISTENT_STATION_CACHE_SECONDS", 86400)
                     await redis_client.setex(persistent_key, persistent_ttl, json.dumps(_serialize_for_cache(cache_data), ensure_ascii=False))
-                    print(f"✅ API 결과 Persistent Cache 저장 완료: key={persistent_key} ttl={persistent_ttl}s")
-                except Exception as _p_e:
-                    print(f"⚠️ Persistent cache write failed (ignored): {_p_e}")
-                print(f"✅ API 결과 Cache 저장 완료: key={cache_key} ttl={settings.CACHE_EXPIRE_SECONDS}s")
-            else:
-                print(f"ℹ️ API 결과 빈 리스트 - 캐시 저장 생략: key={cache_key}")
-        except Exception as _c_err:
-            print(f"⚠️ API 캐시 저장 실패: {_c_err}")
+                except Exception:
+                    pass
+                try:
+                    if redis_client:
+                        await redis_client.incr("metrics:stations:cache_hits:api")
+                except Exception:
+                    pass
+        except Exception:
             pass
-
-        # Metrics: API-path result (best-effort)
-        try:
-            if redis_client:
-                await redis_client.incr("metrics:stations:cache_hits:api")
-        except Exception as _merr:
-            print(f"⚠️ Metric increment (api) failed: {_merr}")
 
         return {
             "source": "kepco_api",
@@ -799,61 +577,48 @@ async def search_ev_stations_requirement_compliant(
             "radius_normalized": actual_radius,
             "stations": api_stations
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
-        print(f"🚨 전체 오류: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
 def calculate_distance_haversine(lat1, lon1, lat2, lon2):
-    """하버사인 공식으로 두 지점 간 거리 계산 (미터)"""
+    """하버사인 공식으로 두 지점 간 거리(미터)를 계산합니다."""
     try:
-        R = 6371000  # 지구 반지름(미터)
+        R = 6371000
         lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
         dlat, dlon = lat2 - lat1, lon2 - lon1
         a = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
         return R * 2 * math.asin(math.sqrt(a))
-    except:
+    except Exception:
         return 999999
 
 
 def _dedupe_stations_by_id(stations):
-    """Deduplicate station dicts by station_id.
-
-    - stations: list of dicts that must contain 'station_id' (string)
-    - Returns a list preserving the first-seen station for each id but
-      merges charger lists if present.
-    """
+    """station_id 기준으로 중복 충전소를 제거하고, chargers 목록은 병합합니다."""
     by_id = {}
     for s in stations:
         sid = str(s.get("station_id", "")).strip()
         if not sid:
-            # keep as-is (no id) using a generated key
-            key = f"_noid_{len(by_id)}"
-            by_id[key] = s
+            by_id[f"_noid_{len(by_id)}"] = s
             continue
 
         if sid not in by_id:
-            # shallow copy to avoid mutating input
             by_id[sid] = dict(s)
         else:
-            # merge non-empty fields
             existing = by_id[sid]
             for k, v in s.items():
                 if k == "chargers":
-                    # merge charger lists uniquely by charger_id
                     existing_ch = existing.get("chargers") or []
-                    new_ch = v or []
                     seen = {c.get("charger_id") for c in existing_ch}
-                    for c in new_ch:
+                    for c in (v or []):
                         if c.get("charger_id") not in seen:
                             existing_ch.append(c)
                             seen.add(c.get("charger_id"))
                     existing["chargers"] = existing_ch
                 else:
-                    # prefer existing non-empty value, otherwise take new
                     if not existing.get(k) and v:
                         existing[k] = v
 
@@ -861,26 +626,15 @@ def _dedupe_stations_by_id(stations):
 
 
 async def _clear_db_transaction(db: AsyncSession):
-    """Ensure the DB session is not in an aborted transaction state.
-
-    Calling rollback when no transaction is active is harmless; this
-    is a defensive helper used before attempting writes so we don't
-    hit InFailedSQLTransactionError caused by a prior failure.
-    """
+    """이전 오류로 세션이 aborted 상태일 경우 rollback으로 복구합니다."""
     try:
         await db.rollback()
     except Exception:
-        # swallow - best effort only
         pass
 
 
 async def _ensure_station_db_id(db: AsyncSession, cs_id: str, item: dict = None, now: datetime = None):
-    """Ensure a station row exists for given cs_id and return its DB primary key id.
-
-    If the station exists, returns the id. If not, attempts to INSERT the station
-    (using provided `item` for fields) and RETURNING id. This centralizes the
-    logic so callers inserting chargers never omit the required station_id FK.
-    """
+    """cs_id에 해당하는 station 행이 없으면 INSERT하고 DB primary key를 반환합니다."""
     if not cs_id:
         return None
 
@@ -890,13 +644,11 @@ async def _ensure_station_db_id(db: AsyncSession, cs_id: str, item: dict = None,
         if row and row._mapping.get("id"):
             return row._mapping.get("id")
     except Exception:
-        # best-effort: clear transaction and continue to attempt insert
         try:
             await _clear_db_transaction(db)
         except Exception:
             pass
 
-    # attempt to insert station using available item data (if any)
     try:
         if now is None:
             now = datetime.now(timezone.utc)
@@ -928,21 +680,17 @@ async def _ensure_station_db_id(db: AsyncSession, cs_id: str, item: dict = None,
         row = r.fetchone()
         if row and row._mapping.get("id"):
             return row._mapping.get("id")
-    except Exception as e:
+    except Exception:
         try:
             await _clear_db_transaction(db)
         except Exception:
             pass
-        print(f"⚠️ _ensure_station_db_id 실패: {e}")
 
     return None
 
 
 def _serialize_for_cache(obj):
-    """Recursively convert common non-JSON types to JSON-serializable values.
-
-    Handles datetime -> ISO string, dicts, lists. Keeps other primitives unchanged.
-    """
+    """datetime 등 JSON 비직렬화 타입을 재귀적으로 직렬화 가능한 값으로 변환합니다."""
     if isinstance(obj, datetime):
         return obj.isoformat()
     if isinstance(obj, dict):
@@ -953,7 +701,7 @@ def _serialize_for_cache(obj):
 
 
 def _parse_to_aware_datetime(val) -> Optional[datetime]:
-    """Normalize various datetime-like inputs to an aware datetime in UTC.
+    """다양한 datetime 표현을 UTC-aware datetime으로 정규화합니다.
 
     Accepts:
     - None -> returns None
@@ -984,7 +732,6 @@ def _parse_to_aware_datetime(val) -> Optional[datetime]:
     if s.endswith("Z") and not s.endswith("+00:00"):
         s = s[:-1] + "+00:00"
 
-    # Try ISO formats first
     try:
         parsed = datetime.fromisoformat(s)
         if parsed.tzinfo is None:
@@ -993,79 +740,52 @@ def _parse_to_aware_datetime(val) -> Optional[datetime]:
     except Exception:
         pass
 
-    # Try compact format YYYYMMDDHHMMSS
+    # YYYYMMDDHHMMSS 포맷
     try:
         parsed = datetime.strptime(s, "%Y%m%d%H%M%S")
         return parsed.replace(tzinfo=timezone.utc)
     except Exception:
         pass
 
-    # Try numeric epoch seconds
+    # 숫자 epoch 시도
     try:
         if re.fullmatch(r"\d+", s):
             ts = int(s)
-            # if length looks like milliseconds, convert
             if len(s) >= 13:
                 ts = ts / 1000.0
-            parsed = datetime.fromtimestamp(ts, tz=timezone.utc)
-            return parsed
-        # float-like
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
         if re.fullmatch(r"\d+\.\d+", s):
-            ts = float(s)
-            parsed = datetime.fromtimestamp(ts, tz=timezone.utc)
-            return parsed
+            return datetime.fromtimestamp(float(s), tz=timezone.utc)
     except Exception:
         pass
 
     return None
 
-@app.get("/api/v1/stations-kepco-2025", tags=["Station"], summary="🚀 KEPCO 2025 API - BRAND NEW")
-async def kepco_2025_new_api_implementation(
-    lat: float = Query(..., description="위도 좌표", ge=-90, le=90),
-    lon: float = Query(..., description="경도 좌표", ge=-180, le=180), 
-    radius: int = Query(..., description="검색 반경(미터) - 필수", ge=100, le=15000),
-    page: int = Query(1, description="페이지 번호", ge=1),
-    limit: int = Query(20, description="페이지당 결과 수", ge=1, le=100),
+
+@app.get("/api/v1/stations-kepco-2025", tags=["Station"], summary="충전소 검색 (구 URL 호환 리다이렉트)")
+async def kepco_2025_redirect(
+    lat: float = Query(..., ge=-90, le=90),
+    lon: float = Query(..., ge=-180, le=180),
+    radius: int = Query(..., ge=100, le=15000),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
     api_key: str = Depends(frontend_api_key_required),
     db: AsyncSession = Depends(get_async_session),
     redis_client: Redis = Depends(get_redis_client)
 ):
-    """
-    🚀 KEPCO 2025 API - 완전히 새로운 구현
-    이전 URL: /ws/chargePoint/curChargePoint (삭제됨)
-    새 URL: /EVchargeManage.do (정확함)
-    """
-    print(f"🚀🚀🚀 KEPCO 2025 COMPLETELY NEW CODE 🚀🚀🚀")
-    print(f"🚀 Function: kepco_2025_new_api_implementation")
-    print(f"🚀 Time: {datetime.now(timezone.utc)}")
-    print(f"🚀 Params: lat={lat}, lon={lon}, radius={radius}")
-    print(f"🚀 ABSOLUTE CONFIRMATION: This is the NEW CODE running!")
-    print(f"🚀 Expected KEPCO URL: https://bigdata.kepco.co.kr/openapi/v1/EVchargeManage.do")
-    
-    # This endpoint is deprecated in favor of the canonical `/api/v1/stations` handler.
-    # For compatibility we return a temporary redirect to the canonical endpoint
-    # preserving the query parameters. Clients should call `/api/v1/stations`.
-    try:
-        target = f"/api/v1/stations?lat={lat}&lon={lon}&radius={radius}&page={page}&limit={limit}"
-        return RedirectResponse(url=target, status_code=307)
-    except Exception as e:
-        print(f"⚠️ Redirect to /api/v1/stations failed: {e}")
-        raise HTTPException(status_code=500, detail="Internal redirect failed")
+    """/api/v1/stations으로의 하위 호환 리다이렉트."""
+    return RedirectResponse(
+        url=f"/api/v1/stations?lat={lat}&lon={lon}&radius={radius}&page={page}&limit={limit}",
+        status_code=307
+    )
 
 
-# --- V1 API 라우터 포함 (일반 사용자 접근 가능) ---
 app.include_router(api_router, prefix="/api/v1")
 
-# --- 관리자 전용 엔드포인트 ---
 admin_router = APIRouter(dependencies=[Depends(admin_required)])
 
-@admin_router.get("/admin-only-data")
-async def admin_data():
-    return {"msg": "관리자 전용 데이터입니다."}
 
-
-# Admin: Redis key inspection (dry-run only, no delete)
-@admin_router.get("/redis/keys", summary="관리자: Redis 키 조회 (삭제하지 않음)")
+@admin_router.get("/redis/keys", summary="관리자: Redis 키 조회")
 async def admin_redis_keys(pattern: str = Query("stations:*", description="SCAN 패턴 (예: stations:*)"),
                            count: int = Query(100, description="SCAN count hint"),
                            redis_client: Redis = Depends(get_redis_client)):
@@ -1079,10 +799,8 @@ async def admin_redis_keys(pattern: str = Query("stations:*", description="SCAN 
 
     keys = []
     try:
-        # async scan_iter is supported by redis.asyncio
         async for k in redis_client.scan_iter(match=pattern, count=count):
             keys.append(k)
-            # limit returned keys to avoid huge payloads
             if len(keys) >= 1000:
                 break
     except Exception as e:
@@ -1091,13 +809,8 @@ async def admin_redis_keys(pattern: str = Query("stations:*", description="SCAN 
     return {"pattern": pattern, "count": len(keys), "keys": keys}
 
 
-@admin_router.get("/redis/debug", summary="관리자: Redis 디버그 정보 (ping/info)")
+@admin_router.get("/redis/debug", summary="관리자: Redis 디버그 정보")
 async def admin_redis_debug(redis_client: Redis = Depends(get_redis_client)):
-    """Admin-only endpoint that returns Redis connectivity and a small INFO summary.
-
-    Protected by admin_required via admin_router. Use this to quickly verify which
-    Redis instance the application is talking to and basic memory/client stats.
-    """
     if not redis_client:
         return JSONResponse(status_code=503, content={"ok": False, "reason": "redis_unavailable"})
     try:
@@ -1105,7 +818,6 @@ async def admin_redis_debug(redis_client: Redis = Depends(get_redis_client)):
     except Exception as e:
         return JSONResponse(status_code=503, content={"ok": False, "reason": f"ping_failed: {e}"})
 
-    # Try to fetch small subset of INFO keys
     info_summary = {}
     try:
         info = await redis_client.info()
@@ -1114,13 +826,11 @@ async def admin_redis_debug(redis_client: Redis = Depends(get_redis_client)):
             "used_memory_human": info.get("used_memory_human"),
             "connected_clients": info.get("connected_clients"),
         }
-    except Exception as _:
+    except Exception:
         info_summary = {"ok": False, "reason": "info_unavailable"}
 
-    # count a small sample of keys in station_detail namespace
     key_count = None
     try:
-        # This is a potentially expensive operation on large datasets; limit by count.
         cnt = 0
         async for _k in redis_client.scan_iter(match="station_detail:*", count=100):
             cnt += 1
@@ -1138,78 +848,13 @@ async def admin_redis_debug(redis_client: Redis = Depends(get_redis_client)):
     }
 
 
-# Register admin_router AFTER all admin routes have been defined so every
-# admin endpoint (e.g. /admin/redis/debug) is included. Previously the
-# router was registered too early which caused routes defined afterwards
-# to be omitted from the app and OpenAPI.
 app.include_router(admin_router, prefix="/admin")
 
 
-# Startup diagnostic: log registered routes so we can verify deployed route registration
-@app.on_event("startup")
-async def _log_registered_routes_on_startup():
-    try:
-        route_paths = sorted({r.path for r in app.routes})
-        print(f"🛠️ Registered routes count={len(route_paths)}")
-        # print a compact sample of admin routes
-        admin_routes = [p for p in route_paths if p.startswith("/admin")]
-        print(f"🛠️ Admin routes ({len(admin_routes)}): {admin_routes}")
-        # explicit check for the specific debug path we expect
-        target = "/admin/redis/debug"
-        if target in route_paths:
-            print(f"✅ Startup check: {target} is REGISTERED")
-        else:
-            print(f"❌ Startup check: {target} is MISSING (this explains 404 responses)")
-        # also log whether OpenAPI is exposed
-        print(f"🛠️ openapi_url={app.openapi_url}")
-    except Exception as e:
-        print(f"⚠️ Failed to enumerate routes on startup: {e}")
-
-
-# Internal debug endpoint (protected by DEBUG_TOKEN env var). This is temporary and
-# should be removed after investigation. Returns registered routes and admin flags.
-@app.get("/internal/debug/admin-routes", include_in_schema=False)
-async def _internal_debug_admin_routes(x_debug_token: Optional[str] = Header(None)):
-    """Return minimal runtime info about registered routes.
-
-    Protection: requires environment variable DEBUG_TOKEN to be set on the server
-    and the same value sent in header `X-Debug-Token`.
-    If DEBUG_TOKEN is not set, the endpoint reports that it is disabled.
-    """
-    debug_token = os.getenv("DEBUG_TOKEN", "")
-    if not debug_token:
-        return JSONResponse(status_code=404, content={"ok": False, "reason": "debug_token_not_configured"})
-
-    if not x_debug_token or x_debug_token != debug_token:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    # Compact list of routes (strings)
-    try:
-        route_paths = sorted({r.path for r in app.routes})
-    except Exception:
-        route_paths = [r.path for r in app.routes]
-
-    return {
-        "ok": True,
-        "is_admin_mode": IS_ADMIN,
-        "openapi_url": app.openapi_url,
-        "routes": route_paths
-    }
-
-
-
-
-# --- DB 연결 테스트 / 간단 조회 엔드포인트 ---
-@app.get("/db-test", tags=["Infrastructure"], summary="DB 연결 및 보조금(subsidy) 조회 테스트")
+@app.get("/db-test", tags=["Infrastructure"], summary="DB 연결 테스트 (subsidies 조회)")
 async def db_test_endpoint(manufacturer: str, model_group: str, db: AsyncSession = Depends(get_async_session), _ok: bool = Depends(frontend_api_key_required)):
-    """제조사(manufacturer)와 모델그룹(model_group)을 받아 `subsidies` 테이블을 조회합니다.
-
-    이 엔드포인트는 OpenAPI 문서에서 두 개의 문자열 쿼리 파라미터로 노출됩니다.
-    """
-    _ok: bool = Depends(frontend_api_key_required)
     start_time = time.time()
     try:
-        # 안전한 파라미터 바인딩으로 쿼리 실행
         query_sql = (
             "SELECT model_name, subsidy_national_10k_won, subsidy_local_10k_won, subsidy_total_10k_won, sale_price "
             "FROM subsidies "
@@ -1220,7 +865,6 @@ async def db_test_endpoint(manufacturer: str, model_group: str, db: AsyncSession
         rows = result.fetchall()
 
         response_time_ms = (time.time() - start_time) * 1000
-        # Map DB columns to frontend-friendly Korean keys
         mapped_rows = []
         for row in rows:
             m = row._mapping
@@ -1229,7 +873,6 @@ async def db_test_endpoint(manufacturer: str, model_group: str, db: AsyncSession
                 "국비(만원)": m.get("subsidy_national_10k_won"),
                 "지방비(만원)": m.get("subsidy_local_10k_won"),
                 "보조금(만원)": m.get("subsidy_total_10k_won"),
-                # include salePrice for debugging/inspection (may be None)
                 "salePrice": int(m.get("sale_price")) if m.get("sale_price") is not None else None,
             })
 
@@ -1249,8 +892,7 @@ async def db_test_endpoint(manufacturer: str, model_group: str, db: AsyncSession
         )
 
 
-# --- Redis 연결 테스트 엔드포인트 ---
-@app.get("/redis-test", tags=["Infrastructure"], summary="Redis 캐시 연결 테스트")
+@app.get("/redis-test", tags=["Infrastructure"], summary="Redis 연결 테스트")
 async def redis_test_endpoint(redis_client: Redis = Depends(get_redis_client)):
     if not redis_client:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Redis client is not initialized or connected.")
@@ -1267,38 +909,20 @@ async def redis_test_endpoint(redis_client: Redis = Depends(get_redis_client)):
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Redis operation FAILED!: {e.__class__.__name__}: {e}")
 
 
-# --- 충전소 아이콘 클릭 → 충전기 스펙 조회 엔드포인트 ---
-@app.get("/api/v1/station/{station_id}/chargers", tags=["Station"], summary="✅ 충전기 스펙 조회 (요구사항 준수)")
+@app.get("/api/v1/station/{station_id}/chargers", tags=["Station"], summary="충전기 스펙 조회")
 async def get_station_charger_specs(
-    station_id: str = Path(..., description="충전소ID (string 타입)"),
-    addr: str = Query(..., description="충전기주소 (string 타입)"),
+    station_id: str = Path(..., description="충전소ID"),
+    addr: str = Query(..., description="충전기주소"),
     api_key: str = Depends(frontend_api_key_required),
     db: AsyncSession = Depends(get_async_session),
     redis_client: Redis = Depends(get_redis_client)
 ):
-    """
-    ✅ 요구사항 2번 - 충전소 아이콘 클릭 → 충전기 스펙 조회
-    
-    1. 프론트 요청: 충전소ID, 충전기주소(addr), API KEY (모두 string)
-    2. 백엔드 로직: DB검색(충전소ID) → API검색(addr) → 캐시 반영 & 동적 데이터 갱신
-    3. 응답: 충전소명칭, 제공가능한충전방식, 각 충전기 정보(상태코드+충전방식 매핑)
-    """
-    print(f"✅ 충전기 스펙 조회 시작")
-    print(f"✅ station_id={station_id}, addr={addr}")
-    
+    """DB 조회 → KEPCO API 호출 순으로 충전기 스펙과 상태를 반환합니다. 30분 이내 데이터는 DB를 재사용합니다."""
     try:
-        # === 1단계: DB 조회 (충전소ID 활용) - 안전한 쿼리 ===
-        print(f"✅ DB에서 충전소 정보 조회...")
-        
-        # 정적 데이터 조회
-        # Try a richer query that uses `static_data_updated_at` if present; if the
-        # column is missing (ProgrammingError) fallback to a simpler query. Also
-        # ensure we rollback any aborted transaction before retrying.
         primary_station_query = """
          SELECT id as station_db_id, cs_id, COALESCE(name, '') AS cs_nm, COALESCE(address, '') AS addr,
              ST_Y(location)::text AS lat, ST_X(location)::text AS longi,
              COALESCE(static_data_updated_at, updated_at) AS last_updated,
-             -- most recent charger dynamic update time for this station
              (SELECT MAX(stat_update_datetime) FROM chargers WHERE cs_id = stations.cs_id) AS last_charger_update
          FROM stations
          WHERE cs_id = :station_id
@@ -1320,56 +944,40 @@ async def get_station_charger_specs(
             try:
                 station_result = await db.execute(text(primary_station_query), {"station_id": station_id})
                 station_row = station_result.fetchone()
-            except ProgrammingError as pe:
-                # Column missing or other programming error — clear transaction and retry with fallback
+            except ProgrammingError:
                 try:
                     await _clear_db_transaction(db)
                 except Exception:
                     pass
-                print(f"⚠️ Primary station query ProgrammingError, falling back: {pe}")
                 try:
                     station_result = await db.execute(text(fallback_station_query), {"station_id": station_id})
                     station_row = station_result.fetchone()
-                except Exception as fallback_err:
+                except Exception:
                     try:
                         await _clear_db_transaction(db)
                     except Exception:
                         pass
-                    print(f"⚠️ Fallback station query failed: {fallback_err}")
                     station_row = None
-            except Exception as station_db_error:
-                # Other DB error: clear and continue
+            except Exception:
                 try:
                     await _clear_db_transaction(db)
                 except Exception:
                     pass
-                print(f"⚠️ DB 조회 오류(충전소 상세): {station_db_error}")
                 station_row = None
         finally:
-            # ensure we aren't leaving an aborted transaction open
             try:
                 await _clear_db_transaction(db)
             except Exception:
                 pass
-        
+
         if not station_row:
-            print(f"⚠️ DB에서 충전소 정보 없음, API 호출로 진행")
             station_info = None
         else:
             station_dict = station_row._mapping
-            # Normalize any datetime-like fields to ISO strings to make caching/JSON safe
-            def _dt_to_iso(val):
-                try:
-                    if isinstance(val, datetime):
-                        return val.isoformat()
-                    return val
-                except Exception:
-                    return None
 
-            # Preserve the raw DB datetime for charger-level latest update so we
-            # can perform accurate freshness comparisons (avoid converting to
-            # ISO string too early). We still present ISO strings when caching
-            # or returning JSON, but internal logic uses datetime objects.
+            def _dt_to_iso(val):
+                return val.isoformat() if isinstance(val, datetime) else val
+
             station_info = {
                 "station_db_id": station_dict.get("station_db_id"),
                 "station_id": str(station_dict["cs_id"]),
@@ -1377,14 +985,10 @@ async def get_station_charger_specs(
                 "addr": str(station_dict["addr"]),
                 "lat": str(station_dict["lat"]),
                 "lon": str(station_dict["longi"]),
-                # keep last_updated as ISO for informational purposes
                 "last_updated": _dt_to_iso(station_dict.get("last_updated")),
-                # keep raw DB value (may be datetime or string) for freshness check
                 "last_charger_update": station_dict.get("last_charger_update")
             }
-            print(f"✅ DB에서 충전소 정보 발견: {station_info['station_name']}")
 
-        # === Redis 캐시 우선 검사 (30분 이내인 경우 바로 반환) ===
         try:
             cache_key = f"station_detail:{station_id}"
             cached_blob = None
@@ -1397,89 +1001,41 @@ async def get_station_charger_specs(
                         cached_blob = None
 
                 if cached_blob and isinstance(cached_blob, dict) and cached_blob.get("timestamp"):
-                    # Robust parsing of cached timestamp:
-                    # - Accept ISO with and without timezone
-                    # - Accept ISO with trailing 'Z' (convert to +00:00)
-                    # - Accept legacy compact format YYYYMMDDHHMMSS
-                    def _parse_cached_ts(raw_ts):
-                        if raw_ts is None:
-                            return None
-                        s = str(raw_ts)
-                        # Handle trailing Z (UTC)
-                        if s.endswith("Z"):
-                            s = s[:-1] + "+00:00"
-                        try:
-                            parsed = datetime.fromisoformat(s)
-                            # Treat naive datetimes as UTC for cache age calculations
-                            if parsed.tzinfo is None:
-                                parsed = parsed.replace(tzinfo=timezone.utc)
-                            return parsed
-                        except Exception:
-                            # Try legacy compact format: YYYYMMDDHHMMSS
-                            try:
-                                parsed = datetime.strptime(s, "%Y%m%d%H%M%S")
-                                return parsed.replace(tzinfo=timezone.utc)
-                            except Exception:
-                                return None
-
-                    cached_ts = _parse_cached_ts(cached_blob.get("timestamp"))
-                    if cached_ts is None:
-                        print("⚠️ Redis 캐시의 timestamp 파싱 실패 - 무시하고 API/DB 검사 진행")
-                    else:
+                    cached_ts = _parse_to_aware_datetime(cached_blob.get("timestamp"))
+                    if cached_ts is not None:
                         age_min = (datetime.now(timezone.utc) - cached_ts).total_seconds() / 60
-                        # use configured detail TTL for cache acceptance (seconds -> minutes)
                         detail_ttl_min = getattr(settings, "CACHE_DETAIL_EXPIRE_SECONDS", 300) / 60
                         if age_min <= detail_ttl_min:
-                            print(f"✅ Redis 캐시 사용: station_detail:{station_id} age={age_min:.1f}min (ttl_min={detail_ttl_min:.1f})")
-                            # normalize cached payload to the endpoint response shape
                             cached_station_info = cached_blob.get("station_info") or {}
                             cached_chargers = cached_blob.get("chargers") or []
                             cached_available = cached_blob.get("available_charge_types") or []
-                            resp = {
+                            return JSONResponse(status_code=200, content={
                                 "station_name": cached_station_info.get("station_name") or cached_station_info.get("cs_nm") or "",
                                 "available_charge_types": ", ".join(cached_available),
                                 "charger_details": cached_chargers,
                                 "total_chargers": len(cached_chargers),
                                 "source": "cache",
                                 "timestamp": cached_blob.get("timestamp")
-                            }
-                            return JSONResponse(status_code=200, content=resp)
-                        else:
-                            print(f"ℹ️ Redis 캐시 존재하지만 만료 기준 초과(age={age_min:.1f}min) - API/DB 검사 진행")
-        except Exception as cache_err:
-            print(f"⚠️ Redis 조회 오류(무시): {cache_err}")
+                            })
+        except Exception:
+            pass
 
-        # === 2단계: 충전기 동적 데이터 갱신 체크 (30분 규칙) ===
         need_api_call = True
         cached_chargers = []
 
         if station_info:
-            # Use the latest charger-level update timestamp (not static station timestamp)
             now = datetime.now(timezone.utc)
-            last_charger_update = station_info.get("last_charger_update")
-
-            # Parse to timezone-aware datetime (UTC) if possible
-            last_charger_update_dt = _parse_to_aware_datetime(last_charger_update)
+            last_charger_update_dt = _parse_to_aware_datetime(station_info.get("last_charger_update"))
 
             if last_charger_update_dt:
                 try:
                     time_diff = (now - last_charger_update_dt).total_seconds() / 60
-                except Exception as td_err:
-                    print(f"⚠️ 시간 차 계산 중 예외: {td_err} now={now} other={last_charger_update_dt}")
+                except Exception:
                     time_diff = None
 
-                if time_diff is not None:
-                    if time_diff <= 30:
-                        print(f"✅ 충전기 데이터가 최신임 (갱신 후 {time_diff:.1f}분), DB의 동적 데이터 사용")
-                        need_api_call = False
-                    else:
-                        print(f"✅ 충전기 데이터가 오래됨 (갱신 후 {time_diff:.1f}분), API 호출 필요")
-                else:
-                    print("⚠️ 충전기 최신 업데이트 시간 비교 불가 - 안전을 위해 API 호출 진행")
-            else:
-                print("✅ 충전기 최신 업데이트 없음(첫 조회 또는 DB에 충전기 데이터 없음 또는 파싱 실패), API 호출 필요")
+                if time_diff is not None and time_diff <= 30:
+                    need_api_call = False
 
-            # If DB is fresh, load charger rows to return
             if not need_api_call:
                 charger_query = """
                     SELECT station_id, cp_id, cp_nm, cp_stat, charge_tp, cs_id, stat_update_datetime, kepco_stat_update_datetime
@@ -1493,29 +1049,25 @@ async def get_station_charger_specs(
 
                 for row in charger_rows:
                     row_dict = row._mapping
-                    # normalize stat_update_datetime to ISO if present
                     sdt = row_dict.get("stat_update_datetime")
-                    sdt_iso = sdt.isoformat() if isinstance(sdt, datetime) else sdt
+                    kepco_ts = row_dict.get("kepco_stat_update_datetime")
                     cached_chargers.append({
                         "charger_id": str(row_dict["cp_id"]),
                         "charger_name": str(row_dict["cp_nm"]),
                         "status_code": str(row_dict.get("cp_stat") or ""),
                         "charge_type": str(row_dict.get("charge_tp") or ""),
-                        "stat_update_datetime": sdt_iso,
-                        "kepco_stat_update_datetime": (row_dict.get("kepco_stat_update_datetime").isoformat() if isinstance(row_dict.get("kepco_stat_update_datetime"), datetime) else row_dict.get("kepco_stat_update_datetime")),
+                        "stat_update_datetime": sdt.isoformat() if isinstance(sdt, datetime) else sdt,
+                        "kepco_stat_update_datetime": kepco_ts.isoformat() if isinstance(kepco_ts, datetime) else kepco_ts,
                         "station_db_id": row_dict.get("station_id")
                     })
-        
-        # === 3단계: API 호출 (필요시) ===
+
         if need_api_call:
-            print(f"✅ KEPCO API 호출로 최신 데이터 조회...")
-            # use module-level `settings` imported at top
             kepco_url = settings.EXTERNAL_STATION_API_BASE_URL
             kepco_key = settings.EXTERNAL_STATION_API_KEY
-            
+
             if not kepco_url or not kepco_key:
                 raise HTTPException(status_code=500, detail="KEPCO API 설정 누락")
-            
+
             async with httpx.AsyncClient() as client:
                 kepco_response = await client.get(
                     kepco_url,
@@ -1526,32 +1078,25 @@ async def get_station_charger_specs(
                     },
                     timeout=30.0
                 )
-                
-                print(f"✅ KEPCO Response Status: {kepco_response.status_code}")
-                
+
                 if kepco_response.status_code != 200:
-                    # API 실패시 DB 데이터 사용
-                    if cached_chargers:
-                        print(f"⚠️ API 실패, 기존 DB 데이터 사용")
-                    else:
+                    if not cached_chargers:
                         raise HTTPException(
                             status_code=502,
                             detail=f"KEPCO API 오류: HTTP {kepco_response.status_code}"
                         )
                 else:
                     kepco_data = kepco_response.json()
-                    
-                    # API 데이터 처리 및 DB 저장
+
                     if isinstance(kepco_data, dict) and "data" in kepco_data:
                         raw_data = kepco_data["data"]
                         updated_chargers = []
                         now = datetime.now(timezone.utc)
-                        
+
                         if isinstance(raw_data, list):
                             for item in raw_data:
                                 try:
                                     if str(item.get("csId", "")) == station_id:
-                                        # 충전소 정보 업데이트
                                         if not station_info:
                                             station_info = {
                                                 "station_id": str(item.get("csId", "")),
@@ -1561,65 +1106,25 @@ async def get_station_charger_specs(
                                                 "lon": str(item.get("longi", ""))
                                             }
 
-                                        # 충전기 정보 수집 (we'll respond with these freshly fetched statuses)
-                                        charger_data = {
+                                        updated_chargers.append({
                                             "charger_id": str(item.get("cpId", "")),
                                             "charger_name": str(item.get("cpNm", "")),
                                             "status_code": str(item.get("cpStat", "")),
                                             "charge_type": str(item.get("chargeTp", ""))
-                                        }
-                                        updated_chargers.append(charger_data)
+                                        })
 
-                                        # DB에 저장 (동적 데이터 갱신) - set stat_update_datetime to now
                                         try:
-                                            # ensure we have the station DB primary key to satisfy chargers.station_id NOT NULL
                                             station_db_id = station_info.get("station_db_id") if station_info else None
-                                            # ensure station_db_id exists (create station row if necessary)
                                             if not station_db_id:
                                                 station_db_id = await _ensure_station_db_id(db, str(item.get("csId")), item=item, now=now)
 
-                                            # determine provider-side timestamp (if any) from API payload
-                                            provider_ts = None
-                                            provider_ts_dt = None
-                                            # Try to extract and parse provider-supplied timestamp from several possible key names.
+                                                provider_ts = None
                                             for k in ("kepco_stat_update_datetime", "stat_update_datetime", "statUpdateDatetime", "statUpdate", "statUpdDt", "update_time", "update_dt", "lastUpdate", "stat_date", "stat_time", "cpStatTime"):
                                                 if k in item and item.get(k):
                                                     raw_ts = item.get(k)
-                                                    # Normalize to ISO UTC when possible; otherwise keep raw string for auditing.
-                                                    try:
-                                                        # try ISO formats first
-                                                        try:
-                                                            parsed = datetime.fromisoformat(str(raw_ts))
-                                                            if parsed.tzinfo is None:
-                                                                # assume UTC if no tz provided
-                                                                parsed = parsed.replace(tzinfo=timezone.utc)
-                                                            provider_ts_dt = parsed.astimezone(timezone.utc)
-                                                            provider_ts = provider_ts_dt.isoformat()
-                                                        except Exception:
-                                                            # try common compact format YYYYMMDDHHMMSS
-                                                            try:
-                                                                parsed = datetime.strptime(str(raw_ts), "%Y%m%d%H%M%S")
-                                                                provider_ts_dt = parsed.replace(tzinfo=timezone.utc)
-                                                                provider_ts = provider_ts_dt.isoformat()
-                                                            except Exception:
-                                                                # fallback: stringify raw value
-                                                                provider_ts = str(raw_ts)
-                                                                provider_ts_dt = None
-                                                    except Exception:
-                                                        provider_ts = str(raw_ts)
-                                                        provider_ts_dt = None
+                                                    ts_dt = _parse_to_aware_datetime(raw_ts)
+                                                    provider_ts = ts_dt.isoformat() if ts_dt else str(raw_ts)
                                                     break
-
-                                            # Log notable discrepancies between provider timestamp and server fetch time for monitoring
-                                            try:
-                                                if provider_ts_dt:
-                                                    delta = now - provider_ts_dt
-                                                    # if provider timestamp differs from server fetch by >5 minutes, log it for review
-                                                    if abs(delta) > timedelta(minutes=5):
-                                                        print(f"⚠️ Provider timestamp discrepancy for csId={item.get('csId')} cpId={item.get('cpId')}: provider={provider_ts_dt.isoformat()} server_fetch={now.isoformat()} delta={delta}")
-                                            except Exception:
-                                                # non-fatal monitoring failure
-                                                pass
 
                                             charger_insert_sql = """
                                                 INSERT INTO chargers (station_id, cp_id, cp_nm, cp_stat, charge_tp, cs_id, stat_update_datetime, kepco_stat_update_datetime)
@@ -1632,13 +1137,7 @@ async def get_station_charger_specs(
                                                     stat_update_datetime = EXCLUDED.stat_update_datetime,
                                                     kepco_stat_update_datetime = EXCLUDED.kepco_stat_update_datetime
                                             """
-                                            # clear any prior aborted transaction
-                                            try:
-                                                await _clear_db_transaction(db)
-                                            except Exception:
-                                                pass
 
-                                            # Ensure we have station_db_id for the foreign key constraint
                                             if station_db_id is not None:
                                                 try:
                                                     await _clear_db_transaction(db)
@@ -1649,20 +1148,15 @@ async def get_station_charger_specs(
                                                         "cp_stat": item.get("cpStat"),
                                                         "charge_tp": item.get("chargeTp"),
                                                         "cs_id": item.get("csId"),
-                                                        # stat_update_datetime stores server fetch time (now) to be used for 30-min freshness checks
                                                         "update_time": now,
-                                                        # kepco_stat_update_datetime stores provider-supplied timestamp (if any) for auditing
                                                         "kepco_ts": provider_ts
                                                     })
-                                                    print(f"✅ 충전기 DB 저장 성공: cp_id={item.get('cpId')}, station_id={station_db_id}")
-                                                except Exception as db_err_inner:
+                                                except Exception:
                                                     try:
                                                         await db.rollback()
                                                     except Exception:
                                                         pass
-                                                    print(f"⚠️ 충전기 DB 저장 오류: {db_err_inner}")
                                             else:
-                                                # station DB id missing -> try to create station then insert charger
                                                 try:
                                                     await _clear_db_transaction(db)
                                                     station_insert_sql = """
@@ -1688,7 +1182,6 @@ async def get_station_charger_specs(
                                                     station_row = result.fetchone()
                                                     if station_row:
                                                         station_db_id = station_row._mapping.get("id")
-                                                        print(f"✅ 충전소 생성됨: station_id={station_db_id}")
                                                         try:
                                                             await db.execute(text(charger_insert_sql), {
                                                                 "station_id": station_db_id,
@@ -1700,51 +1193,34 @@ async def get_station_charger_specs(
                                                                 "update_time": now,
                                                                 "kepco_ts": provider_ts
                                                             })
-                                                            print(f"✅ 충전기 DB 저장 재시도 성공: cp_id={item.get('cpId')}")
-                                                        except Exception as charger_retry_err:
+                                                        except Exception:
                                                             try:
                                                                 await db.rollback()
                                                             except Exception:
                                                                 pass
-                                                            print(f"⚠️ 충전기 재시도 저장 실패: {charger_retry_err}")
-                                                    else:
-                                                        print(f"⚠️ 충전기 DB 저장 스킵: station DB id를 찾을 수 없음 for csId={item.get('csId')}")
-                                                except Exception as station_create_error:
-                                                    print(f"⚠️ 충전소 생성 실패: {station_create_error}")
+                                                except Exception:
                                                     try:
                                                         await _clear_db_transaction(db)
                                                     except Exception:
                                                         pass
-                                        except Exception as db_error:
+                                        except Exception:
                                             try:
                                                 await db.rollback()
                                             except Exception:
                                                 pass
-                                            print(f"⚠️ 충전기 DB 저장 오류: {db_error}")
-                                except Exception as item_error:
-                                    print(f"⚠️ 충전기 데이터 처리 오류: {item_error}")
+                                except Exception:
                                     continue
-                        
-                        # 트랜잭션 커밋
+
                         await db.commit()
-                        # After successful update, respond using freshly fetched charger statuses
                         cached_chargers = updated_chargers
-                        print(f"✅ 충전기 정보 DB 저장 완료: {len(updated_chargers)}개 (fresh)")
-        
-        # === 4단계: 응답 데이터 구성 ===
+
         if not station_info:
             raise HTTPException(status_code=404, detail="충전소 정보를 찾을 수 없습니다.")
-        
-        # 제공 가능한 충전방식 추출
-        available_charge_types = list(set([
-            charger["charge_type"] for charger in cached_chargers 
-            if charger["charge_type"]
-        ]))
-        
-        # 각 충전기 정보 (상태코드 + 충전방식 매핑)
+
+        available_charge_types = list({charger["charge_type"] for charger in cached_chargers if charger["charge_type"]})
+
         charger_details = []
         for charger in cached_chargers:
-            # 상태코드 해석 (KEPCO 기준)
             status_code = charger["status_code"]
             status_text = {
                 "0": "사용가능",
@@ -1765,7 +1241,6 @@ async def get_station_charger_specs(
                 "status_code": status_code,
                 "status_text": status_text,
                 "charge_type": charger["charge_type"],
-                # 추가 사용현황 정보
                 "charge_type_description": {
                     "1": "완속 (AC 3상)",
                     "2": "급속 (DC차데모)",
@@ -1778,37 +1253,29 @@ async def get_station_charger_specs(
                 "last_updated": charger.get("stat_update_datetime", "정보없음"),
                 "availability": "사용가능" if status_code == "1" else "사용불가"
             })
-        
-        # === 5단계: Cache 저장 ===
+
         try:
             cache_key = f"station_detail:{station_id}"
-            
             cache_data = {
                 "station_info": _serialize_for_cache(station_info),
                 "chargers": _serialize_for_cache(charger_details),
                 "available_charge_types": available_charge_types,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
-            # use configured detail TTL (30 minutes by default)
             await redis_client.setex(cache_key, settings.CACHE_DETAIL_EXPIRE_SECONDS, json.dumps(_serialize_for_cache(cache_data), ensure_ascii=False))
-            print(f"✅ 충전소 상세 정보 Cache 저장 완료")
-        except Exception as cache_error:
-            print(f"⚠️ Cache 저장 오류: {cache_error}")
-        
-        # Explicitly mark where the data came from so frontend can display/diagnose
-        response_source = "api" if need_api_call else "database"
+        except Exception:
+            pass
 
         return {
             "station_name": station_info["station_name"],
             "available_charge_types": ", ".join(available_charge_types),
             "charger_details": charger_details,
             "total_chargers": len(charger_details),
-            "source": response_source,
+            "source": "api" if need_api_call else "database",
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        print(f"🚨 충전기 스펙 조회 오류: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")

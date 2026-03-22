@@ -10,7 +10,7 @@ from sqlalchemy.sql import func
 
 Base = declarative_base()
 
-# ------------------ User ------------------
+
 class User(Base):
     __tablename__ = "users"
 
@@ -21,7 +21,7 @@ class User(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=func.now())
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
 
-# ------------------ Station ------------------
+
 class Station(Base):
     __tablename__ = "stations"
 
@@ -29,24 +29,19 @@ class Station(Base):
     station_code: Mapped[str] = mapped_column(String(50), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(200))
     address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    # external identifiers from upstream provider (e.g., bid, cpId or cpKey)
     external_bid: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     external_cp_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-    # raw JSON from upstream provider for debugging / future fields
     raw_data: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     provider: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    # KEPCO specific fields
-    cs_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, unique=True, index=True)  # KEPCO station ID
-    cs_nm: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)  # KEPCO station name
-    addr: Mapped[Optional[str]] = mapped_column(Text, nullable=True, index=True)  # KEPCO address for caching
-    lat: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)  # KEPCO latitude as string
-    longi: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)  # KEPCO longitude as string
+    cs_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, unique=True, index=True)
+    cs_nm: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    addr: Mapped[Optional[str]] = mapped_column(Text, nullable=True, index=True)
+    lat: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    longi: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     location = Column(Geometry(geometry_type='POINT', srid=4326), index=True)
     last_synced_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
-    # Track when static/dynamic data was last updated
     static_data_updated_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
     dynamic_data_updated_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
-
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=func.now())
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -60,7 +55,7 @@ class Station(Base):
     def longitude(self) -> Optional[float]:
         return to_shape(self.location).x if self.location else None
 
-# ------------------ Charger ------------------
+
 class Charger(Base):
     __tablename__ = "chargers"
 
@@ -69,32 +64,28 @@ class Charger(Base):
     charger_code: Mapped[str] = mapped_column(String(50))
     charger_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     connector_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-    # additional external metadata
     external_charger_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-    # raw status code from upstream provider (string like '1','2',...)
     cp_stat_raw: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
-    # timestamp when upstream reported status
     stat_update_datetime: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
     manufacturer: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     model: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     connector_types: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     output_kw: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     status_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    # KEPCO specific fields
-    cp_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, unique=True, index=True)  # KEPCO charger ID
-    cp_nm: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)  # KEPCO charger name
+    cp_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, unique=True, index=True)
+    cp_nm: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     charge_tp: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)  # 1:완속, 2:급속
-    cp_tp: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)  # 충전방식 코드
-    cp_stat: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, index=True)  # 충전기 상태코드 (dynamic)
-    kepco_stat_update_datetime: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)  # KEPCO provider datetime (timestamptz)
-    cs_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)  # Parent station KEPCO ID
+    cp_tp: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    cp_stat: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, index=True)
+    kepco_stat_update_datetime: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    cs_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=func.now())
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
 
     __table_args__ = (UniqueConstraint('station_id', 'charger_code', name='_station_charger_uc'),)
     station: Mapped['Station'] = relationship(back_populates="chargers")
 
-# ------------------ ApiLog ------------------
+
 class ApiLog(Base):
     __tablename__ = "api_logs"
 
@@ -106,7 +97,7 @@ class ApiLog(Base):
     response_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     response_msg: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
-# ------------------ Subsidy ------------------
+
 class Subsidy(Base):
     __tablename__ = "subsidies"
 
@@ -117,5 +108,4 @@ class Subsidy(Base):
     subsidy_national_10k_won = Column(Integer, nullable=False)
     subsidy_local_10k_won = Column(Integer, nullable=False)
     subsidy_total_10k_won = Column(Integer, nullable=False)
-    # 판매가(원) — nullable to match Alembic migration that added this column
     sale_price = Column(Integer, nullable=True)
