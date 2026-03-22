@@ -11,7 +11,6 @@ def get_frontend_api_keys() -> List[str]:
 def frontend_api_key_required(x_api_key: str = Header(...)) -> bool:
     keys = get_frontend_api_keys()
     if not keys:
-        # no keys configured -> deny
         raise HTTPException(status_code=403, detail="API keys not configured")
     if x_api_key not in keys:
         raise HTTPException(status_code=403, detail="Invalid API key")

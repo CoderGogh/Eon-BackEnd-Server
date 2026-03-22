@@ -13,28 +13,17 @@ MOCK_STATIONS_DATA: List[Dict[str, Any]] = [
     {"station_code": "ST0005", "name": "구로 디지털단지 충전소", "address": "서울 구로구 구로동 182-13", "provider": "B사", "latitude": 37.4851, "longitude": 126.8953},
 ]
 
-# -----------------------------
-# 1. 공공 API 호출 Mock
-# -----------------------------
+
 async def fetch_public_api_stations(lat: float, lng: float) -> List[Dict[str, Any]]:
-    """
-    공공 API 호출 Mock (fallback)
-    """
     logger.info(f"Fetching stations from public API for ({lat}, {lng})")
     await asyncio.sleep(0.1)
     return MOCK_STATIONS_DATA
 
-# -----------------------------
-# 2. get_mock_stations 정의
-# -----------------------------
+
 async def get_mock_stations(lat: float, lng: float, radius_km: float = 5.0) -> List[Dict[str, Any]]:
-    """
-    기존 fetch_public_api_stations와 동일 기능, station_service.py에서 사용
-    """
     logger.info(f"Retrieving mock stations near ({lat}, {lng}) with radius {radius_km}km")
     await asyncio.sleep(0.1)
 
-    # Charger 정보 포함
     mock_stations_with_chargers = []
     for station in MOCK_STATIONS_DATA:
         chargers = [{
@@ -50,9 +39,7 @@ async def get_mock_stations(lat: float, lng: float, radius_km: float = 5.0) -> L
 
     return mock_stations_with_chargers
 
-# -----------------------------
-# 3. 충전기 상태 Mock
-# -----------------------------
+
 async def get_mock_charger_status(station_code: str, charger_code: str) -> Optional[int]:
     logger.info(f"Getting mock status for {station_code}/{charger_code}")
     await asyncio.sleep(0.05)
