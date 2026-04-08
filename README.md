@@ -9,13 +9,95 @@
 
 ## 📌 목차
 
-1. [핵심 아키텍처](#-핵심-아키텍처--성능-전략)
-2. [기술 스택](#-기술-스택)
-3. [데이터베이스 스키마](#-데이터베이스-스키마)
-4. [API 명세](#-api-명세)
-5. [시작하기](#-시작하기)
-6. [보안 및 관리자 설정](#-보안--관리자-설정)
-7. [프로젝트 구조](#-프로젝트-구조)
+1. [인프라 구성도](#-인프라-구성도)
+2. [데이터 흐름도](#-데이터-흐름도--cache-first)
+3. [핵심 아키텍처](#️-핵심-아키텍처--성능-전략)
+4. [기술 스택](#-기술-스택)
+5. [데이터베이스 스키마](#-데이터베이스-스키마)
+6. [API 명세](#-api-명세)
+7. [시작하기](#-시작하기)
+8. [보안 및 관리자 설정](#-보안--관리자-설정)
+9. [프로젝트 구조](#-프로젝트-구조)
+
+---
+
+## 🗺 인프라 구성도
+
+전체 시스템은 **Render.com 위의 Docker 컨테이너 4개**로 구성됩니다.
+외부 클라이언트의 요청은 Nginx를 통해 FastAPI로 전달되며, Redis와 PostgreSQL이 데이터 계층을 담당하고, KEPCO API · Nominatim이 외부 데이터 소스 역할을 합니다.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  클라이언트                                                   │
+│   모바일 앱 (x-api-key)          관리자 UI (Basic Auth)      │
+└───────────────┬─────────────────────────┬───────────────────┘
+                │                         │
+┌─────────────────────────────────────────────────────────────┐
+│  Render.com — Docker Network (ev_charger_network)           │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  Nginx  :8080  ← Reverse Proxy / htpasswd Auth      │   │
+│  └──────────────────────┬──────────────────────────────┘   │
+│                          │                                  │
+│         ┌────────────────▼──────────────────────────┐      │
+│         │  FastAPI (Uvicorn / Gunicorn)  :8000       │◄─── Locust :8089
+│         │  async I/O — httpx + asyncpg              │      │
+│         └───┬──────────────────────┬────────────────┘      │
+│             │                      │                        │
+│         ┌───▼───┐          ┌───────▼───────────────┐       │
+│         │ Redis │          │ PostgreSQL + PostGIS   │       │
+│         │ :6379 │          │ stations / chargers    │       │
+│         └───────┘          │ subsidies / api_logs   │       │
+│                            └───────────────────────┘       │
+└─────────────────────────────────────────────────────────────┘
+                          │
+          ┌───────────────┴───────────────┐
+          ▼                               ▼
+    KEPCO API                        Nominatim
+  (충전소·충전기)                   (Geocoding / 폴백)
+```
+
+> **Docker Compose 서비스:** `redis` · `api` · `nginx` · `locust`
+> **프로덕션 실행 명령:** `gunicorn -k uvicorn.workers.UvicornWorker app.main:app`
+
+---
+
+## 🔄 데이터 흐름도 — Cache-First
+
+충전소 조회 요청(`GET /api/v1/stations`)이 처리되는 전체 경로입니다.
+Redis 캐시를 우선 확인하여 응답하고, 미스 시에만 DB 조회 → 외부 API 호출 순으로 진행합니다.
+
+```
+클라이언트
+    │  x-api-key 헤더 포함
+    ▼
+  Nginx  ──── 인증 헤더 검증
+    │
+    ▼
+FastAPI Router
+    │  좌표 파싱 / 정규화 (CACHE_COORD_ROUND_DECIMALS)
+    ▼
+Redis 캐시 조회 (L1, TTL 5분)
+    │
+    ├── [Hit] ─────────────────────────────► 즉시 응답 반환 ✅
+    │
+    └── [Miss]
+          │
+          ▼
+    PostgreSQL / PostGIS
+    ST_DWithin 반경 검색
+          │
+          ├── 정적 정보(이름·위치) → Redis L2에 캐시 (24h)
+          │
+          └── 실시간 충전기 상태 필요?
+                │
+                ▼
+          KEPCO API  (httpx 비동기)
+          └── Nominatim 폴백 (Geocoding 실패 시)
+                │
+                ▼
+          결과 조합 → Redis L1 갱신 → 클라이언트 응답 ✅
+```
 
 ---
 
@@ -52,6 +134,7 @@
 
 - **Geocoding Fallback:** Nominatim 실패 시 지역 단위 폴백으로 서비스 중단 없이 위치 검색 유지
 - **Async I/O:** `httpx`와 `asyncpg`를 이용한 완전 비동기 처리로 동시성 요청 처리 능력 향상
+- **api_logs 테이블:** 모든 외부 API 통신 이력 기록으로 장애 추적성(Traceability) 확보
 
 ---
 
@@ -61,10 +144,12 @@
 | :--- | :--- | :--- |
 | **Framework** | FastAPI | 고성능 비동기 처리 및 자동화된 API 명세(Swagger) 활용 |
 | **Database** | PostgreSQL + PostGIS | 공간 데이터(Geometry) 엔진을 통한 고정밀 위치 검색 |
-| **Cache** | Redis | 다층 캐시 구조 구현 및 시스템 성능 메트릭 추적 |
+| **Cache** | Redis 7 (Alpine) | 다층 캐시 구조 구현 및 시스템 성능 메트릭 추적 |
 | **ORM / Migration** | SQLAlchemy 2.0 / Alembic | Async 환경 최적화 및 안정적인 스키마 버전 관리 |
 | **Auth** | JWT / X-API-Key | 프론트엔드 통신 보안 및 사용자 인증의 이중화 |
 | **Infra** | Docker / Render.com | 컨테이너화를 통한 환경 일관성 및 CI/CD 자동화 |
+| **Load Test** | Locust 2.20 | 실제 트래픽 패턴 기반 부하 시뮬레이션 |
+| **Proxy** | Nginx (Alpine) | Reverse Proxy / Admin Basic Auth / htpasswd 보호 |
 
 ---
 
@@ -75,7 +160,7 @@
 ```
 stations (1) ──── (N) chargers
     │
-    └── PostGIS Geometry 컬럼 (공간 인덱스 기반 반경 검색)
+    └── PostGIS Geometry 컬럼 (ST_DWithin 공간 인덱스)
 
 subsidies ──── 국가·지자체 보조금 데이터 (ILIKE 패턴 매칭)
 api_logs  ──── 외부 API 통신 이력 및 응답 상태 기록
@@ -106,7 +191,7 @@ api_logs  ──── 외부 API 통신 이력 및 응답 상태 기록
 ### 사전 요구사항
 
 - Python 3.12+ / Poetry
-- Docker & Docker Compose (PostGIS, Redis 환경 구성용)
+- Docker & Docker Compose (PostgreSQL + PostGIS, Redis 환경 구성용)
 
 ### 로컬 실행
 
@@ -116,26 +201,33 @@ api_logs  ──── 외부 API 통신 이력 및 응답 상태 기록
 poetry install
 ```
 
-**2. 인프라 실행 (PostgreSQL + Redis)**
+**2. 환경 변수 설정**
+
+```bash
+cp .env.template .env
+# .env 파일에서 DATABASE_URL, REDIS_HOST, EXTERNAL_STATION_API_KEY 등 입력
+```
+
+**3. 인프라 실행 (Redis + API + Nginx + Locust)**
 
 ```bash
 docker-compose up -d
 ```
 
-**3. DB 마이그레이션 및 초기 데이터 적재**
+**4. DB 마이그레이션 및 초기 데이터 적재**
 
 ```bash
 poetry run alembic upgrade head
 poetry run python app/db/init_db.py
 ```
 
-**4. 개발 서버 실행**
+**5. 개발 서버 실행 (로컬 단독 실행 시)**
 
 ```bash
 poetry run uvicorn app.main:app --reload
 ```
 
-서버가 실행되면 `http://localhost:8000/docs` 에서 Swagger UI를 통해 API를 확인할 수 있습니다.
+서버가 실행되면 `http://localhost:8000/docs` 에서 Swagger UI를 확인할 수 있습니다.
 
 ---
 
@@ -144,7 +236,8 @@ poetry run uvicorn app.main:app --reload
 | 설정 | 방식 | 설명 |
 | :--- | :--- | :--- |
 | **Admin Mode** | `ADMIN_MODE=true` 환경변수 | HTTP Basic Auth로 보호된 Swagger UI 및 Redis 모니터링 엔드포인트 활성화 |
-| **API Security** | `x-api-key` 헤더 | 허가된 프론트엔드 서비스와의 통신만 허용 |
+| **Admin 인증** | `ADMIN_CREDENTIALS` + `nginx/.htpasswd` | Nginx 레벨에서 Basic Auth 적용 |
+| **API Security** | `x-api-key` 헤더 (`FRONTEND_API_KEYS`) | 허가된 프론트엔드 서비스와의 통신만 허용 |
 | **User Auth** | JWT Bearer Token | `/api/v1/auth/token` 발급 후 인증 필요 엔드포인트에 사용 |
 
 ---
@@ -152,14 +245,21 @@ poetry run uvicorn app.main:app --reload
 ## 📂 프로젝트 구조
 
 ```
-Backend_Server/
+Eon-BackEnd-Server/
 ├── app/
-│   ├── api/          # 라우터 및 의존성 정의 (Dependency Injection)
-│   ├── core/         # 환경 설정 (Pydantic Settings)
-│   ├── db/           # 비동기 엔진 및 리포지토리 패턴
-│   ├── services/     # 지오코딩 및 보조금 조회 비즈니스 로직
-│   └── models.py     # SQLAlchemy ORM 모델
-├── alembic/          # DB 마이그레이션 히스토리
-├── scripts/          # 데이터 동기화 및 운영 스크립트
-└── docker-compose.yml
+│   ├── api/              # 라우터 및 의존성 정의 (Dependency Injection)
+│   ├── core/             # 환경 설정 (Pydantic Settings)
+│   ├── db/               # 비동기 엔진 및 리포지토리 패턴 (asyncpg)
+│   ├── services/         # 지오코딩 및 보조금 조회 비즈니스 로직
+│   └── models.py         # SQLAlchemy ORM 모델
+├── alembic/              # DB 마이그레이션 히스토리
+├── nginx/
+│   ├── conf.d/           # Nginx 설정
+│   └── .htpasswd         # Admin Basic Auth 파일
+├── scripts/              # 데이터 동기화 및 운영 스크립트
+├── locustfile.py         # 부하 테스트 시나리오
+├── Dockerfile            # Python 3.12-slim 기반 이미지 빌드
+├── docker-compose.yml    # redis / api / nginx / locust 4-서비스 구성
+├── render.yaml           # Render.com 배포 정의
+└── .env.template         # 환경 변수 템플릿
 ```
