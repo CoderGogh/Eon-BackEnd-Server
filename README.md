@@ -26,39 +26,15 @@
 전체 시스템은 **Render.com 위의 Docker 컨테이너 4개**로 구성됩니다.
 외부 클라이언트의 요청은 Nginx를 통해 FastAPI로 전달되며, Redis와 PostgreSQL이 데이터 계층을 담당하고, KEPCO API · Nominatim이 외부 데이터 소스 역할을 합니다.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  클라이언트                                                   │
-│   모바일 앱 (x-api-key)          관리자 UI (Basic Auth)      │
-└───────────────┬─────────────────────────┬───────────────────┘
-                │                         │
-┌─────────────────────────────────────────────────────────────┐
-│  Render.com — Docker Network (ev_charger_network)           │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  Nginx  :8080  ← Reverse Proxy / htpasswd Auth      │   │
-│  └──────────────────────┬──────────────────────────────┘   │
-│                          │                                  │
-│         ┌────────────────▼──────────────────────────┐      │
-│         │  FastAPI (Uvicorn / Gunicorn)  :8000       │◄─── Locust :8089
-│         │  async I/O — httpx + asyncpg              │      │
-│         └───┬──────────────────────┬────────────────┘      │
-│             │                      │                        │
-│         ┌───▼───┐          ┌───────▼───────────────┐       │
-│         │ Redis │          │ PostgreSQL + PostGIS   │       │
-│         │ :6379 │          │ stations / chargers    │       │
-│         └───────┘          │ subsidies / api_logs   │       │
-│                            └───────────────────────┘       │
-└─────────────────────────────────────────────────────────────┘
-                          │
-          ┌───────────────┴───────────────┐
-          ▼                               ▼
-    KEPCO API                        Nominatim
-  (충전소·충전기)                   (Geocoding / 폴백)
-```
+### 🏗️ Infrastructure Architecture
 
-> **Docker Compose 서비스:** `redis` · `api` · `nginx` · `locust`
-> **프로덕션 실행 명령:** `gunicorn -k uvicorn.workers.UvicornWorker app.main:app`
+<p align="center">
+  <img src="./images/infra-architecture.svg" alt="EON Infrastructure Architecture Diagram" width="80%"/>
+</p>
+
+* **Render.com (Docker):** 컨테이너 기반의 통합 배포 환경 구성
+* **FastAPI (Uvicorn/Gunicorn):** 비동기 I/O 및 고성능 WSGI 워커 기반 애플리케이션 서버
+* **Locust:** 시스템 성능 측정을 위한 내부 부하 테스트 도구 통합
 
 ---
 
@@ -67,37 +43,16 @@
 충전소 조회 요청(`GET /api/v1/stations`)이 처리되는 전체 경로입니다.
 Redis 캐시를 우선 확인하여 응답하고, 미스 시에만 DB 조회 → 외부 API 호출 순으로 진행합니다.
 
-```
-클라이언트
-    │  x-api-key 헤더 포함
-    ▼
-  Nginx  ──── 인증 헤더 검증
-    │
-    ▼
-FastAPI Router
-    │  좌표 파싱 / 정규화 (CACHE_COORD_ROUND_DECIMALS)
-    ▼
-Redis 캐시 조회 (L1, TTL 5분)
-    │
-    ├── [Hit] ─────────────────────────────► 즉시 응답 반환 ✅
-    │
-    └── [Miss]
-          │
-          ▼
-    PostgreSQL / PostGIS
-    ST_DWithin 반경 검색
-          │
-          ├── 정적 정보(이름·위치) → Redis L2에 캐시 (24h)
-          │
-          └── 실시간 충전기 상태 필요?
-                │
-                ▼
-          KEPCO API  (httpx 비동기)
-          └── Nominatim 폴백 (Geocoding 실패 시)
-                │
-                ▼
-          결과 조합 → Redis L1 갱신 → 클라이언트 응답 ✅
-```
+### 🔄 Data Flow: Cache-First Strategy
+
+<p align="center">
+  <img src="./images/data-flow.svg" alt="Cache-First Data Flow Sequence Diagram" width="85%"/>
+</p>
+
+* **X-API-Key:** 프론트엔드 전용 API 키 인증 (Nginx 레이어)
+* **L1 (5min) TTL:** 좌표 기반 검색 결과 단기 캐싱
+* **PostGIS ST_DWithin:** 캐시 미스 시 DB 레벨 공간 쿼리 수행
+* **Backfill Logic:** DB 데이터 부재 시 KEPCO 외부 API 호출 및 DB/캐시 백필
 
 ---
 
