@@ -29,12 +29,12 @@
 ### 🏗️ Infrastructure Architecture
 
 <p align="center">
-  <img src="./images/infra-architecture.svg" alt="EON Infrastructure Architecture Diagram" width="80%"/>
+  <img src="./docs/eon_infrastructure_diagram.svg" alt="EON Infrastructure Architecture" width="85%" />
 </p>
 
-* **Render.com (Docker):** 컨테이너 기반의 통합 배포 환경 구성
-* **FastAPI (Uvicorn/Gunicorn):** 비동기 I/O 및 고성능 WSGI 워커 기반 애플리케이션 서버
-* **Locust:** 시스템 성능 측정을 위한 내부 부하 테스트 도구 통합
+* **Reverse Proxy:** Nginx를 통한 보안 레이어 및 요청 라우팅
+* **Performance:** Gunicorn + Uvicorn worker 기반의 고성능 비동기 처리
+* **Monitoring:** Locust를 활용한 부하 테스트 및 시스템 가용성 검증
 
 ---
 
@@ -46,13 +46,12 @@ Redis 캐시를 우선 확인하여 응답하고, 미스 시에만 DB 조회 →
 ### 🔄 Data Flow: Cache-First Strategy
 
 <p align="center">
-  <img src="./images/data-flow.svg" alt="Cache-First Data Flow Sequence Diagram" width="85%"/>
+  <img src="./docs/eon_data_flow_diagram.svg" alt="EON Data Flow Diagram" width="85%" />
 </p>
 
-* **X-API-Key:** 프론트엔드 전용 API 키 인증 (Nginx 레이어)
-* **L1 (5min) TTL:** 좌표 기반 검색 결과 단기 캐싱
-* **PostGIS ST_DWithin:** 캐시 미스 시 DB 레벨 공간 쿼리 수행
-* **Backfill Logic:** DB 데이터 부재 시 KEPCO 외부 API 호출 및 DB/캐시 백필
+* **Auth Layer:** Nginx 단계에서 `x-api-key` 검증 후 내부 라우터 전달
+* **Cache-First:** Redis L1 캐시 확인 후 미스 시에만 PostGIS 공간 쿼리 실행
+* **Data Integrity:** 외부 KEPCO API 호출 시 DB 업서트와 캐시 백필 동시 수행
 
 ---
 
