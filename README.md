@@ -29,7 +29,7 @@
 ### 🏗️ Infrastructure Architecture
 
 <p align="center">
-  <img src="./docs/eon_infrastructure_diagram.svg" alt="EON Infrastructure Architecture" width="85%" />
+  <img src="./docs/eon_infrastructure_diagram.svg" alt="EON Infrastructure Architecture" width="65%" />
 </p>
 
 * **Reverse Proxy:** Nginx를 통한 보안 레이어 및 요청 라우팅
@@ -46,7 +46,7 @@ Redis 캐시를 우선 확인하여 응답하고, 미스 시에만 DB 조회 →
 ### 🔄 Data Flow: Cache-First Strategy
 
 <p align="center">
-  <img src="./docs/eon_data_flow_diagram.svg" alt="EON Data Flow Diagram" width="85%" />
+  <img src="./docs/eon_data_flow_diagram.svg" alt="EON Data Flow Diagram" width="70%" />
 </p>
 
 * **Auth Layer:** Nginx 단계에서 `x-api-key` 검증 후 내부 라우터 전달
